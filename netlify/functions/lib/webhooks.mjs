@@ -1,7 +1,7 @@
 
 import { accessToken, shopDomain } from './shopify.mjs';
 import { syncRules } from './rules.mjs';
-import { syncRules } from './lib/rules.mjs';
+
 
 /**
  * Shopify signs the *raw* body with the app's client secret. During secret
