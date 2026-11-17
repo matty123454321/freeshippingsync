@@ -106,6 +106,33 @@ function sameRules(a, b) {
   return a.freeThreshold === b.freeThreshold && a.currency === b.currency && a.standardShipping === b.standardShipping;
 }
 
+// Shopify includes the selected provinces in a delivery zone, even when the
+// ENTIRE country is selected. Previously, any nonempty provinces array was
+// wrongly considered a partial-country rate (including the UK).
+// These province totals are verified against the store's fully selected zones
+// on 17 Nov 2026. Refuse unknown or partial provincial coverage to avoid
+// advertising a rate that only applies to some addresses.
+const FULL_PROVINCE_COUNTS = Object.freeze({
+  GB: 5, US: 62, CA: 13, AU: 8, KR: 17, JP: 47, NZ: 17,
+  IE: 26, IT: 110, PT: 20, RO: 42, ES: 52, TR: 81,
+});
+const COMPLETE_UK_CODES = new Set(['BFP', 'ENG', 'NIR', 'SCT', 'WLS']);
+
+export function coversWholeCountry(country) {
+  const code = country?.code?.countryCode;
+  if (!code || country.code.restOfWorld) return false;
+  const provinces = country.provinces || [];
+  const expected = FULL_PROVINCE_COUNTS[code];
+  if (expected == null) return provinces.length === 0;
+  if (provinces.length !== expected) return false;
+  const codes = new Set(provinces.map(province => province.code));
+  if (codes.size !== expected) return false;
+  if (code === 'GB') {
+    for (const ukCode of COMPLETE_UK_CODES) if (!codes.has(ukCode)) return false;
+  }
+  return true;
+}
+
 async function allProfiles(token) {
   const profiles = [];
   let after = null;
@@ -144,6 +171,7 @@ export async function buildShippingRules(token) {
   if (!main) throw new Error('No general/default merchant delivery profile found');
   const markets = {};
   const conflicts = new Set();
+  let zonesWithEligibleFreeRates = 0;
   for (const group of main.profileLocationGroups) {
     if (group.locationGroupZones.pageInfo.hasNextPage) {
       throw new Error('More zones than supported; refusing incomplete sync');
@@ -151,9 +179,11 @@ export async function buildShippingRules(token) {
     for (const entry of group.locationGroupZones.nodes) {
       const rule = rulesFromZone(entry);
       if (!rule) continue;
+      zonesWithEligibleFreeRates++;
       for (const country of entry.zone.countries) {
-        // A country with subregional-only rates or rest-of-world grouping is not safe to advertise broadly.
-        if (country.code.restOfWorld || !country.code.countryCode || country.provinces.length) continue;
+        // Include complete-country zones even when Shopify lists every province.
+        // Never advertise a partially covered or unknown provincial zone.
+        if (!coversWholeCountry(country)) continue;
         const code = country.code.countryCode;
         if (markets[code] && !sameRules(markets[code], rule)) conflicts.add(code);
         else markets[code] = rule;
@@ -161,6 +191,11 @@ export async function buildShippingRules(token) {
     }
   }
   for (const code of conflicts) delete markets[code];
+  // Avoid erasing all storefront thresholds if the parser cannot map any
+  // countries despite Shopify returning free-shipping rates.
+  if (zonesWithEligibleFreeRates > 0 && Object.keys(markets).length === 0) {
+    throw new Error('Shopify has active free-shipping rates, but no country could be mapped. Refusing to overwrite the last good shipping rules.');
+  }
   const handles = await excludedProductHandles(token, profiles);
   const result = {
     source: 'shopify_delivery_profiles',
