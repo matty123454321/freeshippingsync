@@ -1,36 +1,73 @@
-import { adminGraphQL } from './shopify.mjs';
+import { createHmac, timingSafeEqual } from 'node:crypto';
+import { accessToken, shopDomain } from './lib/shopify.mjs';
+import { syncRules } from './lib/rules.mjs';
 
-const SUBS = `query { webhookSubscriptions(first: 50) { nodes { id topic uri } pageInfo { hasNextPage } } }`;
-const CREATE = `mutation CreateHook($topic: WebhookSubscriptionTopic!, $webhookSubscription: WebhookSubscriptionInput!) {
-  webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) {
-    webhookSubscription { id topic uri }
-    userErrors { field message }
-  }
-}`;
+/**
+ * Shopify signs the *raw* body with the app's client secret. During secret
+ * rotation, Shopify can continue to use the oldest unrevoked secret. The
+ * optional SHOPIFY_WEBHOOK_SECRET lets that signing secret be verified without
+ * changing SHOPIFY_CLIENT_SECRET (used by the OAuth client credentials flow).
+ */
+function signatureMatches(rawBody, base64Signature, secret) {
+  if (!secret || !base64Signature) return false;
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(base64Signature)) return false;
+  const received = Buffer.from(base64Signature, 'base64');
+  if (received.length !== 32) return false;
+  const expected = createHmac('sha256', secret).update(rawBody).digest();
+  return timingSafeEqual(received, expected);
+}
 
-export async function ensureWebhooks(token) {
-  const site = process.env.PUBLIC_BASE_URL;
-  if (!site || !/^https:\/\/[^/]+$/.test(site)) {
-    throw new Error('PUBLIC_BASE_URL must be https://your-site.netlify.app with no trailing slash');
+export default async function handler(request) {
+  if (request.method !== 'POST') {
+    return new Response('Method Not Allowed', { status: 405 });
   }
-  const uri = `${site}/.netlify/functions/shopify-webhook`;
-  const existing = await adminGraphQL(token, SUBS);
-  if (existing.webhookSubscriptions.pageInfo.hasNextPage) {
-    throw new Error('More than 50 webhook subscriptions; manual review required');
+
+  // Capture the body byte-for-byte before parsing it; reserializing JSON breaks
+  // the Shopify HMAC check.
+  const rawBody = Buffer.from(await request.arrayBuffer());
+  const signature = request.headers.get('x-shopify-hmac-sha256');
+  const standardSecret = process.env.SHOPIFY_CLIENT_SECRET;
+  const rotatingSecret = process.env.SHOPIFY_WEBHOOK_SECRET;
+  const valid = signatureMatches(rawBody, signature, standardSecret) ||
+    signatureMatches(rawBody, signature, rotatingSecret);
+
+  if (!valid) {
+    // Diagnostics deliberately contain NO credentials, payloads, or hashes.
+    console.error('Shopify webhook rejected: HMAC verification failed', {
+      topic: request.headers.get('x-shopify-topic'),
+      shop: request.headers.get('x-shopify-shop-domain'),
+      webhookId: request.headers.get('x-shopify-webhook-id'),
+      signatureHeaderPresent: Boolean(signature),
+      rawBodyBytes: rawBody.byteLength,
+      clientSecretConfigured: Boolean(standardSecret),
+      additionalWebhookSecretConfigured: Boolean(rotatingSecret),
+    });
+    return new Response('Invalid Shopify webhook signature', { status: 401 });
   }
-  const wanted = ['PROFILES_CREATE', 'PROFILES_UPDATE', 'PROFILES_DELETE'];
-  const installed = [];
-  for (const topic of wanted) {
-    if (existing.webhookSubscriptions.nodes.some(h => h.topic === topic && h.uri === uri)) {
-      installed.push({ topic, status: 'already registered' });
-      continue;
-    }
-    const result = await adminGraphQL(token, CREATE, { topic, webhookSubscription: { uri } });
-    const payload = result?.webhookSubscriptionCreate;
-    if (payload?.userErrors?.length || !payload?.webhookSubscription?.id) {
-      throw new Error(`Could not register ${topic}: ${JSON.stringify(payload?.userErrors || [])}`);
-    }
-    installed.push({ topic, status: 'registered' });
+
+  if (request.headers.get('x-shopify-shop-domain') !== shopDomain()) {
+    console.error('Shopify webhook rejected: unexpected shop domain');
+    return new Response('Wrong shop', { status: 403 });
   }
-  return installed;
+
+  const topic = request.headers.get('x-shopify-topic');
+  if (!['profiles/create', 'profiles/update', 'profiles/delete'].includes(topic)) {
+    return new Response('Ignored topic', { status: 200 });
+  }
+
+  try {
+    const token = await accessToken();
+    const result = await syncRules(token);
+    console.info('Shopify shipping profile webhook synced', {
+      topic,
+      webhookId: request.headers.get('x-shopify-webhook-id'),
+      updatedAt: result?.updatedAt,
+      markets: Object.keys(result?.markets || {}),
+    });
+    return new Response('Synced', { status: 200 });
+  } catch (error) {
+    console.error('Shopify webhook sync failure:', error.message);
+    // Shopify retries non-2xx deliveries.
+    return new Response('Sync failed; retry', { status: 503 });
+  }
 }
