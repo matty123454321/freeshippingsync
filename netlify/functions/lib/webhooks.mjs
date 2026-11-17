@@ -1,5 +1,6 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
-import { accessToken, shopDomain } from './lib/shopify.mjs';
+
+import { accessToken, shopDomain } from './shopify.mjs';
+import { syncRules } from './rules.mjs';
 import { syncRules } from './lib/rules.mjs';
 
 /**
