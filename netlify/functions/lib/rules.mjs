@@ -77,7 +77,16 @@ export function extractFreeThreshold(method) {
 }
 
 function extractFlatRate(method) {
-  if (!method.active || (method.methodConditions || []).length !== 0) return null;
+  if (!method.active) return null;
+  // An explicit zero order minimum is equivalent to a flat rate.
+  // Reject real price bounds and weight conditions for a universal estimate.
+  for (const condition of method.methodConditions || []) {
+    const criteria = condition.conditionCriteria;
+    if (condition.field !== 'TOTAL_PRICE' ||
+        condition.operator !== 'GREATER_THAN_OR_EQUAL_TO' ||
+        criteria?.__typename !== 'MoneyV2' ||
+        Number(criteria.amount) !== 0 || criteria.amount == null || criteria.amount === '') return null;
+  }
   const price = shippingPrice(method);
   if (!price) return null;
   const amount = Number(price.amount);
